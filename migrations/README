@@ -1,0 +1,6 @@
+Alembic 数据库迁移目录。
+
+env.py 复用项目数据库配置，并导入 ORM 模型以注册表结构。
+versions/ 保存每次变更的 upgrade（升级）及 downgrade（回退）步骤。
+修改模型后生成迁移，审查内容，再执行 upgrade head。
+具体命令见项目根目录 README.md，不要在迁移文件里保存数据库密码。
