@@ -2,6 +2,28 @@
 
 适合逐步学习的 FastAPI 项目骨架，按业务模块组织代码。已实现用户注册、登录、当前用户和退出接口，并与 my-blob-api 的用户字段对齐。
 
+## 角色管理与文章管理
+
+- 管理员（角色 1）：可访问角色管理，查询和维护所有文章。
+- 普通用户（角色 2）：可阅读已发布文章。
+- 文章编辑（角色 3）：可新建文章，只能查询管理、编辑、发布、删除自己的文章（含草稿），不能分配角色。
+
+管理员接口：`GET /admin/users` 分页查询用户（`page`、`limit`、`q`、`role`），
+`GET /admin/roles` 查询可分配角色，`PATCH /admin/users/{id}/role` 替换用户角色。
+保存请求示例：`{"roleIds":[2,3]}`。每人至少保留一个角色，并且系统至少保留一位管理员。
+角色变更在事务中完成，服务端每次访问管理接口都会查询当前角色，旧 JWT 不会保留已撤销的权限。
+
+文章接口兼容 myBlob：公开阅读 `GET /articles`、`GET /articles/{id}`；
+管理员和文章编辑可访问 `GET /articles/manage`、`GET /articles/manage/{id}`、
+`POST /articles`、`PATCH /articles/{id}`、`DELETE /articles/{id}`。
+管理列表及总数按文章归属过滤；编辑访问他人文章的管理详情、修改或删除接口返回 404。同时拥有角色 1 和 3 时按管理员权限处理。
+更新文章时需提交当前 `version`，版本冲突返回 409；正文经过 HTML 清理，草稿不会公开返回。
+迁移 `60ba1b3b77ce` 创建文章表，其他环境需执行 `uv run alembic upgrade head`。
+
+JWT 无效返回 401，角色不满足要求返回 403，响应仍使用 `code/message`。
+myBlob 收到当前登录请求的 401/403 后清除 token 和用户缓存、跳转登录页；
+旧请求迟到的鉴权失败不会清除后续新登录的会话。Redis 不可用返回 503，不触发强制登出。
+
 ## 启动
 
 在项目根目录执行：
@@ -9,6 +31,8 @@
 ```bash
 uv sync
 cp .env.example .env
+# 设置 JWT_SECRET，启动 Redis：docker compose up -d
+uv run alembic upgrade head
 uv run uvicorn python_backend.main:app --reload
 ```
 
@@ -27,7 +51,7 @@ curl -X POST http://127.0.0.1:8000/users/register \
 ```
 
 成功返回 `201` 和公开用户资料；用户名或邮箱重复返回 `409`，输入校验失败返回 `422`。
-返回字段与旧接口保持 camelCase（如 `isAdmin`、`workExperiences`、`createdAt`），不返回密码哈希。
+返回字段采用 camelCase（如 `workExperiences`、`createdAt`），不返回密码哈希。
 
 建议按下面顺序读代码，文件中有解释职责和关键行为的中文注释：
 
@@ -73,12 +97,13 @@ uv run alembic check
 
 用户字段与 my-blob-api 对齐，包括：
 
-- 基础字段：`id`、`name`、`username`、`email`、`password_hash`、`created_at`、`updated_at`。
-- 权限字段：`is_admin`，默认 false。
+- 基础字段：`id`、`name`、`username`、`email`、`created_at`、`updated_at`。
+- 角色通过 `user_roles` 关联 `roles`，支持多角色；新注册用户默认拥有角色 2（普通用户）。`is_admin` 已移除。
 - 资料字段：`location`、`website`、`bio`、`avatar`、`phone`、`about`，默认空字符串。
 - JSONB 字段：`skills`、`work_experiences`，默认空数组。
 
 字段长度、可空性和默认值沿用旧项目：用户名和密码哈希允许 NULL，以支持仅创建资料的用户；注册接口仍强制填写。注册时 `name` 默认等于用户名。
+`password_hash` 是仅供服务端验证密码的凭据，不属于公开资料响应；登录依赖它校验用户名和密码，因此不能随 JWT 改造一起删除。JWT 取代的是数据库会话记录，不取代密码哈希。
 用户名和邮箱有忽略大小写的唯一索引。`onupdate` 是 ORM 的更新行为，不是数据库触发器，手写 SQL 更新时需自行更新 `updated_at`。
 
 新增迁移 `92f0b3c1a801_align_user_profile.py` 补齐字段，并用已有 username 回填 name，不重建用户表。回退该迁移会删除新增资料字段；若已有用户名或密码为空的资料用户，恢复非空约束会失败，需先处理数据。
@@ -119,16 +144,18 @@ uv run alembic check          # 检查 ORM 模型与数据库是否还有待生�
 
 ## 登录、当前用户与退出
 
-认证协议参考相邻的 my-blob-api，沿用以下地址和响应：
+认证接口沿用以下地址和响应：
 
-- `POST /users/login`：请求 `{"username":"alice","password":"password123"}`，成功返回 200 和 `{"user":{公开用户资料},"token":"64位十六进制令牌"}`。
+- `POST /users/login`：请求 `{"username":"alice","password":"password123"}`，成功返回 200 和 `{"user":{公开用户资料},"token":"JWT"}`。
 - `GET /users/me`：携带 `Authorization: Bearer <token>`，成功返回 200 和公开用户资料；未登录、令牌无效或过期返回 401 和“请先登录”。
-- `POST /users/logout`：携带同一请求头，删除对应会话，返回 204 空响应。重复退出或未携带令牌也返回 204。
+- `POST /users/logout`：携带同一请求头，把 JWT 的 `jti` 放入 Redis 黑名单直到令牌过期，返回 204 空响应。重复退出或未携带令牌也返回 204。
 
 用户名去首尾空格且忽略大小写。登录密码允许 1–128 字符，不套用注册复杂度规则，不去除空格。
 用户名或密码错误统一返回 401 和“用户名或密码不正确”；输入格式错误继续沿用本项目的 422 错误协议。
 登录不会设置 Cookie，客户端需保存 token 并在后续请求中携带 Bearer 请求头。
+登录、注册和当前用户响应的用户资料包含 `roles` 数组，每个角色返回 `id`、`name`、`nameCn`。迁移为已有用户补上角色 2，并把原管理员标志转换为角色 1；前端返回的角色用于展示，不能替代后端接口权限校验。
 
-令牌使用 32 字节安全随机数生成，有效期一天；`user_sessions` 表只保存 SHA-256 摘要。
-退出仅撤销当前令牌，同一用户的其他会话继续有效；每次成功登录顺带清理过期会话。
-新增迁移 `b137d42f8a90_create_user_sessions.py`，其他环境启动前执行 `uv run alembic upgrade head`。
+令牌使用 HS256 签名，包含用户 ID（`sub`）、唯一令牌 ID（`jti`）和过期时间（`exp`），有效期由 `JWT_EXPIRE_SECONDS` 配置。受保护请求会检查 Redis 黑名单；Redis 不可用时返回 503 并拒绝请求。
+退出仅撤销当前令牌，同一用户的其他登录令牌仍有效。新增迁移 `c8d0f6a12b34_drop_user_sessions.py` 删除旧 `user_sessions` 表；运行 `uv run alembic upgrade head` 后该表及其中数据会被删除。该迁移不可逆。
+
+Redis 通过根目录的 `compose.yaml` 运行：`docker compose up -d` 启动，`docker compose ps` 查看状态，`docker compose down` 停止并移除容器（数据卷保留）。`.env` 设置 `REDIS_URL`，本机运行后端时默认地址为 `redis://127.0.0.1:6379/0`。设置 `JWT_SECRET` 为随机秘密值，不要提交 `.env`。

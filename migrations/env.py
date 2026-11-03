@@ -2,6 +2,8 @@ from alembic import context
 
 from python_backend.db.base import Base
 from python_backend.db.engine import database_url, engine
+from python_backend.modules.articles.models import Article  # noqa: F401 -- 注册文章表
+from python_backend.modules.roles.models import Role  # noqa: F401 -- 注册角色表
 from python_backend.modules.users.models import User  # noqa: F401 -- 导入后注册用户表
 
 target_metadata = Base.metadata

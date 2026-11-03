@@ -45,13 +45,21 @@ class WorkExperience(BaseModel):
     description: str
 
 
+class RoleResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, alias_generator=to_camel, populate_by_name=True)
+
+    id: int
+    name: str
+    name_cn: str
+
+
 class UserResponse(BaseModel):
     """只列出公开字段；即使 ORM 有密码哈希，也不会被返回。"""
 
     model_config = ConfigDict(from_attributes=True, alias_generator=to_camel, populate_by_name=True)
 
     id: UUID
-    is_admin: bool
+    roles: list[RoleResponse]
     name: str
     email: str
     username: str | None

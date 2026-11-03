@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     db_name: str = Field(default="python_backend", min_length=1)
     db_user: str = Field(default="postgres", min_length=1)
     db_password: SecretStr = SecretStr("")
+    redis_url: str = "redis://127.0.0.1:6379/0"
+    jwt_secret: SecretStr
+    jwt_expire_seconds: int = Field(default=3600, gt=0)
 
 
 settings = Settings()

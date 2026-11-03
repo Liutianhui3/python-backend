@@ -12,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 from python_backend.db.base import Base
 from python_backend.db.session import get_session
 from python_backend.main import app
+from python_backend.modules.roles.models import Role, UserRole
 from python_backend.modules.users.models import User
 from python_backend.modules.users.service import UserAlreadyExistsError
 
@@ -23,10 +24,18 @@ def client_session():
     )
     Base.metadata.create_all(engine)
     with Session(engine) as session:
+        session.add_all(
+            [
+                Role(id=1, name="admin", name_cn="管理员"),
+                Role(id=2, name="common", name_cn="普通用户"),
+            ]
+        )
+        session.commit()
         app.dependency_overrides[get_session] = lambda: session
         try:
-            with TestClient(app) as client:
-                yield client, session
+            with patch("python_backend.modules.users.router.redis_client.set"):
+                with TestClient(app) as client:
+                    yield client, session
         finally:
             app.dependency_overrides.clear()
     engine.dispose()
@@ -46,12 +55,19 @@ def test_register(client_session):
     data = response.json()
     assert data["username"] == data["name"] == "Alice"
     assert data["email"] == "alice@example.com"
-    assert data["isAdmin"] is False
+    assert "isAdmin" not in data
+    assert data["roles"] == [{"id": 2, "name": "common", "nameCn": "普通用户"}]
     assert data["skills"] == data["workExperiences"] == []
     assert data["avatar"] == data["about"] == ""
     assert data["id"] and data["createdAt"] and data["updatedAt"]
     assert not any("password" in key.lower() for key in data)
     user = session.scalar(select(User))
+    assert session.get(UserRole, (user.id, 2)) is not None
+    assert session.get(UserRole, (user.id, 1)) is None
+    session.add(UserRole(user_id=user.id, role_id=1))
+    session.commit()
+    role_ids = session.scalars(select(UserRole.role_id).where(UserRole.user_id == user.id))
+    assert set(role_ids) == {1, 2}
     salt, digest = user.password_hash.split(":")
     assert (
         digest
@@ -151,9 +167,6 @@ def test_unexpected_error_format(client_session):
 
 
 def test_login_me_logout(client_session):
-    from python_backend.modules.users.models import UserSession
-    from python_backend.modules.users.service import token_hash
-
     client, session = client_session
     payload = {"username": "alice", "email": "alice@example.com", "password": "password123"}
     user = client.post("/users/register", json=payload).json()
@@ -163,13 +176,17 @@ def test_login_me_logout(client_session):
     data = response.json()
     assert data["user"] == user
     token = data["token"]
-    assert len(token) == 64
-    stored = session.scalar(select(UserSession))
-    assert stored.token_hash == token_hash(token) != token
+    assert len(token.split(".")) == 3
     headers = {"Authorization": f"Bearer {token}"}
-    assert client.get("/users/me", headers=headers).json() == user
-    assert client.post("/users/logout", headers=headers).content == b""
-    assert client.get("/users/me", headers=headers).status_code == 401
+    with patch("python_backend.modules.users.router.redis_client.exists", return_value=0):
+        assert client.get("/users/me", headers=headers).json() == user
+    with patch("python_backend.modules.users.router.redis_client.set") as redis_set:
+        assert client.post("/users/logout", headers=headers).content == b""
+        redis_set.assert_called_once()
+        assert redis_set.call_args.args[0].startswith("blacklist:")
+        assert redis_set.call_args.kwargs["ex"] > 0
+    with patch("python_backend.modules.users.router.redis_client.exists", return_value=1):
+        assert client.get("/users/me", headers=headers).status_code == 401
     assert client.post("/users/logout", headers=headers).status_code == 204
     assert client.post("/users/logout").status_code == 204
 
@@ -201,24 +218,23 @@ def test_bad_credentials(client_session, username, password):
     assert response.json()["message"] == "用户名或密码不正确"
 
 
-def test_expired_session(client_session):
-    from datetime import UTC, datetime, timedelta
+def test_expired_token(client_session):
+    import jwt
 
-    from python_backend.modules.users.models import UserSession
+    from python_backend.core.config import settings
 
     client, session = client_session
     client.post(
         "/users/register",
         json={"username": "alice", "email": "alice@example.com", "password": "password123"},
     )
-    credentials = {"username": "alice", "password": "password123"}
-    token = client.post("/users/login", json=credentials).json()["token"]
-    stored = session.scalar(select(UserSession))
-    stored.expires_at = datetime.now(UTC) - timedelta(seconds=1)
-    session.commit()
+    user = session.scalar(select(User))
+    token = jwt.encode(
+        {"sub": str(user.id), "jti": "expired", "iat": 1, "exp": 2},
+        settings.jwt_secret.get_secret_value(),
+        algorithm="HS256",
+    )
     assert client.get("/users/me", headers={"Authorization": f"Bearer {token}"}).status_code == 401
-    assert client.post("/users/login", json=credentials).status_code == 200
-    assert len(session.scalars(select(UserSession)).all()) == 1
 
 
 @pytest.mark.parametrize("authorization", ["Basic abc", "Bearer bad", "Bearer " + "g" * 64])
@@ -236,3 +252,168 @@ def test_login_validation(client_session, changes):
     client, _ = client_session
     response = client.post("/users/login", json={"username": "alice", "password": "a1"} | changes)
     assert response.status_code == 422
+
+
+@pytest.fixture
+def role_accounts(client_session):
+    from python_backend.core.security import create_access_token
+    from python_backend.modules.users.service import hash_password
+
+    client, session = client_session
+    session.add(Role(id=3, name="editor", name_cn="文章编辑"))
+    accounts = {}
+    for label, role_id in [("admin", 1), ("reader", 2), ("editor", 3)]:
+        user = User(
+            username=label,
+            name=label,
+            email=f"{label}@example.com",
+            password_hash=hash_password("password123"),
+        )
+        session.add(user)
+        session.flush()
+        session.add(UserRole(user_id=user.id, role_id=role_id))
+        accounts[label] = (
+            user.id,
+            {"Authorization": f"Bearer {create_access_token(str(user.id))}"},
+        )
+    session.commit()
+    with patch("python_backend.modules.users.router.redis_client.exists", return_value=0):
+        yield client, session, accounts
+
+
+def test_role_assignment_and_live_permissions(role_accounts):
+    client, session, accounts = role_accounts
+    admin_id, admin = accounts["admin"]
+    reader_id, reader = accounts["reader"]
+    _, editor = accounts["editor"]
+    assert client.get("/admin/users", headers=reader).status_code == 403
+    assert client.get("/admin/users", headers=editor).status_code == 403
+    assert client.get("/admin/users").status_code == 401
+    assert len(client.get("/admin/roles", headers=admin).json()) == 3
+    response = client.get("/admin/users", params={"q": "reader"}, headers=admin)
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["roles"][0]["id"] == 2
+    response = client.patch(
+        f"/admin/users/{reader_id}/role", headers=admin, json={"roleIds": [2, 3, 3]}
+    )
+    assert response.status_code == 200
+    assert [r["id"] for r in response.json()["roles"]] == [2, 3]
+    assert (
+        client.patch(
+            f"/admin/users/{reader_id}/role", headers=admin, json={"roleIds": []}
+        ).status_code
+        == 422
+    )
+    assert session.get(UserRole, (reader_id, 2)) is not None
+    assert client.get("/articles/manage", headers=reader).status_code == 200
+    assert (
+        client.patch(
+            f"/admin/users/{reader_id}/role", headers=editor, json={"roleIds": [1]}
+        ).status_code
+        == 403
+    )
+    assert (
+        client.patch(
+            f"/admin/users/{reader_id}/role", headers=admin, json={"roleIds": [999]}
+        ).status_code
+        == 422
+    )
+    assert (
+        client.patch(
+            f"/admin/users/{admin_id}/role", headers=admin, json={"roleIds": [2]}
+        ).status_code
+        == 409
+    )
+    assert (
+        client.patch(
+            f"/admin/users/{reader_id}/role", headers=admin, json={"roleIds": [2]}
+        ).status_code
+        == 200
+    )
+    assert client.get("/articles/manage", headers=reader).status_code == 403
+
+
+def test_editor_article_crud_and_visibility(role_accounts):
+    client, _, accounts = role_accounts
+    _, reader = accounts["reader"]
+    _, editor = accounts["editor"]
+    body = {"title": "文章", "content": "<p>正文</p><script>alert(1)</script>", "status": "draft"}
+    assert client.post("/articles", json=body, headers=reader).status_code == 403
+    response = client.post("/articles", json=body, headers=editor)
+    assert response.status_code == 200
+    article = response.json()
+    assert "<script" not in article["content"]
+    assert client.get(f"/articles/{article['id']}").status_code == 404
+    assert client.get("/articles").json()["total"] == 0
+    assert client.get("/articles/manage", headers=editor).json()["total"] == 1
+    response = client.patch(
+        f"/articles/{article['id']}",
+        headers=editor,
+        json={**body, "status": "published", "version": 1},
+    )
+    assert response.status_code == 200
+    assert response.json()["version"] == 2
+    assert client.get("/articles").json()["total"] == 1
+    assert (
+        client.patch(
+            f"/articles/{article['id']}", headers=editor, json={**body, "version": 1}
+        ).status_code
+        == 409
+    )
+    assert client.delete(f"/articles/{article['id']}", headers=reader).status_code == 403
+    assert client.delete(f"/articles/{article['id']}", headers=editor).status_code == 204
+
+
+@pytest.mark.parametrize("status", ["draft", "published"])
+def test_article_owner_isolation(role_accounts, status):
+    client, session, accounts = role_accounts
+    admin_id, admin = accounts["admin"]
+    other_id, other_editor = accounts["reader"]
+    _, editor = accounts["editor"]
+    session.add_all([UserRole(user_id=other_id, role_id=3), UserRole(user_id=admin_id, role_id=3)])
+    session.commit()
+    session.expire_all()
+    body = {"title": "隔离文章", "content": "<p>正文</p>", "status": status}
+    own = client.post("/articles", json=body, headers=editor).json()
+    other = client.post("/articles", json=body, headers=other_editor).json()
+    admin_article = client.post("/articles", json=body, headers=admin).json()
+
+    for headers, expected in [(editor, own), (other_editor, other)]:
+        response = client.get(
+            "/articles/manage",
+            headers=headers,
+            params={"q": "隔离", "status": status, "limit": 1},
+        )
+        assert response.status_code == 200
+        assert response.json()["total"] == 1
+        assert [a["id"] for a in response.json()["items"]] == [expected["id"]]
+        assert client.get(f"/articles/manage/{expected['id']}", headers=headers).status_code == 200
+
+    for article in [other, admin_article]:
+        article_id = article["id"]
+        assert client.get(f"/articles/manage/{article_id}", headers=editor).status_code == 404
+        assert (
+            client.patch(
+                f"/articles/{article_id}",
+                headers=editor,
+                json={**body, "title": "越权修改", "version": 1},
+            ).status_code
+            == 404
+        )
+        assert client.delete(f"/articles/{article_id}", headers=editor).status_code == 404
+        detail = client.get(f"/articles/manage/{article_id}", headers=admin)
+        assert detail.status_code == 200
+        assert detail.json()["title"] == body["title"]
+        assert detail.json()["version"] == 1
+
+    assert client.get("/articles/manage", headers=admin).json()["total"] == 3
+    assert client.get("/articles").json()["total"] == (3 if status == "published" else 0)
+    assert (
+        client.patch(
+            f"/articles/{other['id']}",
+            headers=admin,
+            json={**body, "title": "管理员修改", "version": 1},
+        ).status_code
+        == 200
+    )
+    assert client.delete(f"/articles/{other['id']}", headers=admin).status_code == 204

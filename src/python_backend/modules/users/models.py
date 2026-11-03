@@ -1,11 +1,12 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, String, Text, func, text
+from sqlalchemy import JSON, DateTime, Index, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from python_backend.db.base import Base
+from python_backend.modules.roles.models import Role
 
 
 class User(Base):
@@ -17,7 +18,9 @@ class User(Base):
     # 旧项目支持仅创建资料的用户，因此用户名、密码允许 NULL；注册时仍必填。
     username: Mapped[str | None] = mapped_column(String(32))
     name: Mapped[str] = mapped_column(String(100))
-    is_admin: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    roles: Mapped[list[Role]] = relationship(
+        secondary="user_roles", viewonly=True, order_by=Role.id
+    )
     # 资料默认空字符串，不要求注册时填写；管理员权限不能从注册请求传入。
     location: Mapped[str] = mapped_column(String(60), server_default="")
     website: Mapped[str] = mapped_column(String(240), server_default="")
@@ -45,13 +48,3 @@ class User(Base):
         Index("users_username_unique", func.lower(username), unique=True),
         Index("users_email_unique", func.lower(email), unique=True),
     )
-
-
-class UserSession(Base):
-    """只保存令牌摘要，与旧项目 user_sessions 表兼容。"""
-
-    __tablename__ = "user_sessions"
-
-    token_hash: Mapped[str] = mapped_column(Text, primary_key=True)
-    user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
-    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

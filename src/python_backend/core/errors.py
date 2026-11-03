@@ -29,6 +29,8 @@ def validation_message(error: dict) -> str:
     field = str(error["loc"][-1]) if error["loc"] else "请求参数"
     label = {"username": "用户名", "email": "邮箱", "password": "密码"}.get(field, "请求参数")
     kind = error["type"]
+    if field == "roleIds" and kind == "too_short":
+        return "每个用户至少需要一个角色"
     if kind == "json_invalid":
         return "请求体不是有效的 JSON"
     if kind == "extra_forbidden":

@@ -2,13 +2,14 @@
 
 import hashlib
 import secrets
-from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from python_backend.modules.users.models import User, UserSession
+from python_backend.core.security import create_access_token
+from python_backend.modules.roles.models import UserRole
+from python_backend.modules.users.models import User
 from python_backend.modules.users.schemas import RegisterRequest
 
 
@@ -33,6 +34,9 @@ def register_user(session: Session, request: RegisterRequest) -> User:
     )
     session.add(user)
     try:
+        # flush 获取用户 ID；用户和默认角色关联在同一事务中提交。
+        session.flush()
+        session.add(UserRole(user_id=user.id, role_id=2))
         # 唯一索引是最终防线：先查询再插入仍可能出现并发竞争。
         session.commit()
     except IntegrityError as error:
@@ -63,37 +67,18 @@ def verify_password(password: str, stored: str | None) -> bool:
     return secrets.compare_digest(actual, expected) and valid
 
 
-def token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
 def login_user(session: Session, username: str, password: str) -> tuple[User, str]:
     user = session.scalar(select(User).where(func.lower(User.username) == username.lower()))
     if not verify_password(password, user.password_hash if user else None) or user is None:
         raise InvalidCredentialsError
-    now = datetime.now(UTC)
-    token = secrets.token_hex(32)
-    session.execute(delete(UserSession).where(UserSession.expires_at <= now))
-    session.add(
-        UserSession(
-            token_hash=token_hash(token), user_id=user.id, expires_at=now + timedelta(days=1)
-        )
-    )
-    session.commit()
-    return user, token
+    return user, create_access_token(str(user.id))
 
 
-def current_user(session: Session, token: str) -> User | None:
-    return session.scalar(
-        select(User)
-        .join(UserSession, UserSession.user_id == User.id)
-        .where(
-            UserSession.token_hash == token_hash(token),
-            UserSession.expires_at > datetime.now(UTC),
-        )
-    )
+def current_user(session: Session, user_id: str) -> User | None:
+    from uuid import UUID
 
-
-def logout_user(session: Session, token: str) -> None:
-    session.execute(delete(UserSession).where(UserSession.token_hash == token_hash(token)))
-    session.commit()
+    try:
+        parsed_id = UUID(user_id)
+    except ValueError:
+        return None
+    return session.scalar(select(User).where(User.id == parsed_id))
