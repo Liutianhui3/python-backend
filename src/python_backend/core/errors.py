@@ -8,6 +8,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException
 
+from python_backend.modules.ai.errors import AIError
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,6 +53,10 @@ def validation_message(error: dict) -> str:
 
 
 def register_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AIError)
+    async def handle_ai_error(request: Request, error: AIError) -> JSONResponse:
+        return error_response(error.code, str(error))
+
     # 捕获 Starlette HTTPException，才能同时处理框架产生的 404 / 405。
     @app.exception_handler(HTTPException)
     async def handle_http_error(request: Request, error: HTTPException) -> JSONResponse:
